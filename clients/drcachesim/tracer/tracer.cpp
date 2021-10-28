@@ -49,6 +49,7 @@
 #include "drreg.h"
 #include "drutil.h"
 #include "drx.h"
+#include "drstatecmp.h"
 #include "droption.h"
 #include "instru.h"
 #include "raw2trace.h"
@@ -1707,34 +1708,10 @@ event_delay_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t
     }
 #        endif
 
-    /* hit_instr_count_threshold does not always return. Restore scratch registers and
-     * aflags.
-     */
-#        ifdef X86_64
-    /* FIXME i#4711: Need to restore for x86 the arithmetic flags and (if used) the
-     * scratch register before the call to hit_instr_count_threshold. However, this
-     * fix seems to cause instability. So, we're leaving x86 as technically broken to
-     * keep our tests green until the source of instability is found.
-     */
-#            ifndef DISABLED_FOR_BUG_4711
-    drreg_statelessly_restore_app_value(drcontext, bb, DR_REG_NULL, instr, instr, NULL,
-                                        NULL);
-    if (scratch != DR_REG_NULL) {
-        drreg_statelessly_restore_app_value(drcontext, bb, scratch, instr, instr, NULL,
-                                            NULL);
-    }
-#            endif
-#        elif defined(AARCH64)
-    drreg_statelessly_restore_app_value(drcontext, bb, scratch1, instr, instr, NULL,
-                                        NULL);
-    if (scratch2 != DR_REG_NULL) {
-        drreg_statelessly_restore_app_value(drcontext, bb, scratch2, instr, instr, NULL,
-                                            NULL);
-    }
-#        endif
-    dr_insert_clean_call(drcontext, bb, instr, (void *)hit_instr_count_threshold,
-                         false /*fpstate */, 1,
-                         OPND_CREATE_INTPTR((ptr_uint_t)instr_get_app_pc(instr)));
+    dr_insert_clean_call_ex(drcontext, bb, instr, (void *)hit_instr_count_threshold,
+                            static_cast<dr_cleancall_save_t>(
+                                DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_MULTIPATH),
+                            1, OPND_CREATE_INTPTR((ptr_uint_t)instr_get_app_pc(instr)));
     MINSERT(bb, instr, skip_call);
 
 #        ifdef X86_64
@@ -1758,9 +1735,10 @@ event_delay_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t
      * inlining of check_instr_count_threshold is not implemented for i386. For now we pay
      * the cost of a clean call every time for 32-bit architectures.
      */
-    dr_insert_clean_call(drcontext, bb, instr, (void *)check_instr_count_threshold,
-                         false /*fpstate */, 2, OPND_CREATE_INT32(num_instrs),
-                         OPND_CREATE_INTPTR((ptr_uint_t)instr_get_app_pc(instr)));
+    dr_insert_clean_call_ex(drcontext, bb, instr, (void *)check_instr_count_threshold,
+                            DR_CLEANCALL_READS_APP_CONTEXT, 2,
+                            OPND_CREATE_INT32(num_instrs),
+                            OPND_CREATE_INTPTR((ptr_uint_t)instr_get_app_pc(instr)));
 #endif
     return DR_EMIT_DEFAULT;
 }
@@ -1997,6 +1975,11 @@ event_exit(void)
         !drmgr_unregister_thread_exit_event(event_thread_exit) ||
         drreg_exit() != DRREG_SUCCESS)
         DR_ASSERT(false);
+    if (op_enable_drstatecmp.get_value()) {
+        if (drstatecmp_exit() != DRSTATECMP_SUCCESS) {
+            DR_ASSERT(false);
+        }
+    }
     dr_unregister_exit_event(event_exit);
 
     /* Clear callbacks and globals to support re-attach when linked statically. */
@@ -2202,6 +2185,12 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
     if (!drmgr_init() || !drutil_init() || drreg_init(&ops) != DRREG_SUCCESS ||
         !drx_init())
         DR_ASSERT(false);
+    if (op_enable_drstatecmp.get_value()) {
+        drstatecmp_options_t drstatecmp_ops = { NULL };
+        if (drstatecmp_init(&drstatecmp_ops) != DRSTATECMP_SUCCESS) {
+            DR_ASSERT(false);
+        }
+    }
 
     /* register events */
     dr_register_exit_event(event_exit);

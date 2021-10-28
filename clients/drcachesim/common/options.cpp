@@ -314,13 +314,15 @@ droption_t<std::string>
                           "Specifies the replacement policy for TLBs. "
                           "Supported policies: LFU (Least Frequently Used).");
 
-droption_t<std::string> op_simulator_type(
-    DROPTION_SCOPE_FRONTEND, "simulator_type", CPU_CACHE,
-    "Simulator type (" CPU_CACHE ", " MISS_ANALYZER ", " TLB ", " REUSE_DIST
-    ", " REUSE_TIME ", " HISTOGRAM ", " VIEW ", " FUNC_VIEW ", or " BASIC_COUNTS ").",
-    "Specifies the type of the simulator. "
-    "Supported types: " CPU_CACHE ", " MISS_ANALYZER ", " TLB ", " REUSE_DIST
-    ", " REUSE_TIME ", " HISTOGRAM "or " BASIC_COUNTS ".");
+droption_t<std::string>
+    op_simulator_type(DROPTION_SCOPE_FRONTEND, "simulator_type", CPU_CACHE,
+                      "Simulator type (" CPU_CACHE ", " MISS_ANALYZER ", " TLB
+                      ", " REUSE_DIST ", " REUSE_TIME ", " HISTOGRAM ", " VIEW
+                      ", " FUNC_VIEW ", " BASIC_COUNTS ", or " INVARIANT_CHECKER ").",
+                      "Specifies the type of the simulator. "
+                      "Supported types: " CPU_CACHE ", " MISS_ANALYZER ", " TLB
+                      ", " REUSE_DIST ", " REUSE_TIME ", " HISTOGRAM ", " BASIC_COUNTS
+                      ", or " INVARIANT_CHECKER ".");
 
 droption_t<unsigned int> op_verbose(DROPTION_SCOPE_ALL, "verbose", 0, 0, 64,
                                     "Verbosity level",
@@ -331,13 +333,11 @@ droption_t<bool>
                        "Show every traced call in the func_trace tool",
                        "In the func_trace tool, this controls whether every traced call "
                        "is shown or instead only aggregate statistics are shown.");
-#ifdef DEBUG
 droption_t<bool> op_test_mode(DROPTION_SCOPE_ALL, "test_mode", false, "Run sanity tests",
                               "Run extra analyses for sanity checks on the trace.");
 droption_t<std::string> op_test_mode_name(
     DROPTION_SCOPE_ALL, "test_mode_name", "", "Run custom sanity tests",
     "Run extra analyses for specific sanity checks by name on the trace.");
-#endif
 droption_t<bool> op_disable_optimizations(
     DROPTION_SCOPE_ALL, "disable_optimizations", false,
     "Disable offline trace optimizations for testing",
@@ -564,3 +564,7 @@ droption_t<double> op_confidence_threshold(
     "results. Confidence in a discovered pattern for a load instruction is calculated "
     "as the fraction of the load's misses with the discovered pattern over all the "
     "load's misses.");
+droption_t<bool> op_enable_drstatecmp(
+    DROPTION_SCOPE_CLIENT, "enable_drstatecmp", false, "Enable the drstatecmp library.",
+    "When true, this option enables the drstatecmp library that performs state "
+    "comparisons to detect instrumentation-induced bugs due to state clobbering.");

@@ -51,6 +51,7 @@
 #ifdef LINUX
 #    include "include/sigcontext.h"
 #    include "include/signalfd.h"
+#    include "include/clone3.h"
 #    include "../globals.h" /* after our sigcontext.h, to preclude bits/sigcontext.h */
 #elif defined(MACOS)
 #    include "../globals.h" /* this defines _XOPEN_SOURCE for Mac */
@@ -197,7 +198,17 @@ typedef struct _clone_record_t {
     app_pc continuation_pc;
     thread_id_t caller_id;
     int clone_sysnum;
+#ifdef LINUX
+    /* Flags in the args to SYS_clone3 are 64-bit. */
+    uint64 clone_flags;
+    /* Pointer to the app's copy of clone_args.
+     * We restore this to the corresponding reg
+     * post-syscall in the child thread.
+     */
+    clone3_syscall_args_t *app_clone_args;
+#else
     uint clone_flags;
+#endif
     thread_sig_info_t info;
     thread_sig_info_t *parent_info;
     void *pcprofile_info;
@@ -651,11 +662,21 @@ is_thread_signal_info_initialized(dcontext_t *dcontext)
  * XXX i#1403: for Mac we want to eventually do lower-level earlier interception
  * of threads, but for now we're later and higher-level, intercepting the user
  * thread function on the new thread's stack.  We ignore app_thread_xsp.
+ *
+ * On Linux, dr_clone_args and app_clone_args are set only for SYS_clone3; also
+ * app_thread_xsp is NULL for SYS_clone3.
  */
 void *
 #ifdef MACOS
 create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp, app_pc thread_func,
                     void *thread_arg)
+#elif defined(LINUX)
+create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp,
+                    /* Do not store dr_clone_args; it is freed in the parent thread
+                     * in the post-syscall handling of clone3.
+                     */
+                    clone3_syscall_args_t *dr_clone_args,
+                    clone3_syscall_args_t *app_clone_args)
 #else
 create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp)
 #endif
@@ -681,10 +702,29 @@ create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp)
          */
         record = (clone_record_t *)(dstack - sizeof(clone_record_t));
         ASSERT(ALIGNED(record, get_ABI_stack_alignment()));
-        record->app_thread_xsp = *app_thread_xsp;
+#ifdef LINUX
+        ASSERT((dcontext->sys_num != SYS_clone3 && app_thread_xsp != NULL &&
+                dr_clone_args == NULL && app_clone_args == NULL) ||
+               (dcontext->sys_num == SYS_clone3 && dr_clone_args != NULL &&
+                app_clone_args != NULL && app_thread_xsp == NULL));
+        if (app_clone_args != NULL) {
+            /* SYS_clone3 has the lowest address of the stack in
+             * cl_args->stack. But we expect the highest (non-inclusive)
+             * in the clone record's app_thread_xsp.
+             */
+            record->app_thread_xsp = app_clone_args->stack + app_clone_args->stack_size;
+            record->clone_flags = app_clone_args->flags;
+            record->app_clone_args = app_clone_args;
+        } else {
+#endif
+            record->app_thread_xsp = *app_thread_xsp;
+            record->clone_flags = dcontext->sys_param0;
+            IF_LINUX(record->app_clone_args = NULL);
+#ifdef LINUX
+        }
+#endif
         /* asynch_target is set in d_r_dispatch() prior to calling pre_system_call(). */
         record->continuation_pc = dcontext->asynch_target;
-        record->clone_flags = dcontext->sys_param0;
 #ifdef MACOS
     }
 #endif
@@ -718,23 +758,30 @@ create_clone_record(dcontext_t *dcontext, reg_t *app_thread_xsp)
     LOG(THREAD, LOG_ASYNCH, 1, "create_clone_record: thread " TIDFMT ", pc " PFX "\n",
         record->caller_id, record->continuation_pc);
 
-#ifdef MACOS
-    if (app_thread_xsp != NULL) {
-#endif
-        /* Set the thread stack to point to the dstack, below the clone record.
-         * Note: it's glibc who sets up the arg to the thread start function;
-         * the kernel just does a fork + stack swap, so we can get away w/ our
-         * own stack swap if we restore before the glibc asm code takes over.
-         * We restore this parameter to the app value in
-         * restore_clone_param_from_clone_record().
-         */
-        /* i#754: set stack to be XSTATE aligned for saving YMM registers */
+#ifdef LINUX
+    if (dr_clone_args != NULL) {
         ASSERT(ALIGNED(XSTATE_ALIGNMENT, REGPARM_END_ALIGN));
-        *app_thread_xsp = ALIGN_BACKWARD(record, XSTATE_ALIGNMENT);
-#ifdef MACOS
+        /* SYS_clone3 expects the lowest address of the stack in dr_clone_args->stack. */
+        dr_clone_args->stack = (ptr_uint_t)(dstack - DYNAMORIO_STACK_SIZE);
+        dr_clone_args->stack_size =
+            (uint64)ALIGN_BACKWARD(record, XSTATE_ALIGNMENT) - dr_clone_args->stack;
+    } else {
+#endif
+        if (IF_MACOS_ELSE(app_thread_xsp != NULL, true)) {
+            /* Set the thread stack to point to the dstack, below the clone record.
+             * Note: it's glibc who sets up the arg to the thread start function;
+             * the kernel just does a fork + stack swap, so we can get away w/ our
+             * own stack swap if we restore before the glibc asm code takes over.
+             * We restore this parameter to the app value in
+             * restore_clone_param_from_clone_record().
+             */
+            /* i#754: Set stack to be XSTATE aligned for saving YMM registers */
+            ASSERT(ALIGNED(XSTATE_ALIGNMENT, REGPARM_END_ALIGN));
+            *app_thread_xsp = ALIGN_BACKWARD(record, XSTATE_ALIGNMENT);
+        }
+#ifdef LINUX
     }
 #endif
-
     return (void *)record;
 }
 
@@ -859,12 +906,24 @@ restore_clone_param_from_clone_record(dcontext_t *dcontext, void *record)
 #ifdef LINUX
     ASSERT(record != NULL);
     clone_record_t *crec = (clone_record_t *)record;
-    if (crec->clone_sysnum == SYS_clone && TEST(CLONE_VM, crec->clone_flags)) {
+    if (TEST(CLONE_VM, crec->clone_flags)) {
         /* Restore the original stack parameter to the syscall, which we clobbered
          * in create_clone_record().  Some apps examine it post-syscall (i#3171).
          */
-        set_syscall_param(dcontext, SYSCALL_PARAM_CLONE_STACK,
-                          get_mcontext(dcontext)->xsp);
+        if (crec->clone_sysnum == SYS_clone) {
+            set_syscall_param(dcontext, SYSCALL_PARAM_CLONE_STACK,
+                              get_mcontext(dcontext)->xsp);
+        } else if (crec->clone_sysnum == SYS_clone3) {
+#    ifdef X86
+            set_syscall_param(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS,
+                              (reg_t)crec->app_clone_args);
+#    else
+            /* On AArchXX r0 is used to pass the first arg to the syscall as well as
+             * to hold its return value. As the clone_args pointer isn't available
+             * post-syscall natively anyway, there's no need to restore here.
+             */
+#    endif
+        }
     }
 #endif
 }
@@ -1730,7 +1789,7 @@ signal_reinstate_alarm_handlers(dcontext_t *dcontext)
  */
 
 void
-handle_clone(dcontext_t *dcontext, uint flags)
+handle_clone(dcontext_t *dcontext, uint64 flags)
 {
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
     if ((flags & CLONE_VM) == 0) {
@@ -3169,7 +3228,7 @@ convert_rt_mask_to_nonrt(sigframe_plain_t *f_plain, kernel_sigset_t *sigmask)
 
 static void
 convert_frame_to_nonrt(dcontext_t *dcontext, int sig, sigframe_rt_t *f_old,
-                       sigframe_plain_t *f_new)
+                       sigframe_plain_t *f_new, size_t f_new_alloc_size)
 {
 #    ifdef X86
     sigcontext_t *sc_old = get_sigcontext_from_rt_frame(f_old);
@@ -3178,9 +3237,17 @@ convert_frame_to_nonrt(dcontext_t *dcontext, int sig, sigframe_rt_t *f_old,
     memcpy(&f_new->sc, get_sigcontext_from_rt_frame(f_old), sizeof(sigcontext_t));
     if (sc_old->fpstate != NULL) {
         /* up to caller to include enough space for fpstate at end */
+        uint offset_fpstate_xsave = offsetof(kernel_fpstate_t, _fxsr_env);
+        /* i#5079: The kernel requires the xsave area to be 64-byte aligned, which
+         * starts at _fxsr_env in kernel_fpstate_t.
+         */
         byte *new_fpstate =
-            (byte *)ALIGN_FORWARD(((byte *)f_new) + sizeof(*f_new), XSTATE_ALIGNMENT);
-        memcpy(new_fpstate, sc_old->fpstate, signal_frame_extra_size(false));
+            (byte *)ALIGN_FORWARD(((byte *)f_new) + sizeof(*f_new) + offset_fpstate_xsave,
+                                  XSTATE_ALIGNMENT) -
+            offset_fpstate_xsave;
+        size_t extra_size = signal_frame_extra_size(false);
+        ASSERT(new_fpstate + extra_size <= (byte *)f_new + f_new_alloc_size);
+        memcpy(new_fpstate, sc_old->fpstate, extra_size);
         f_new->sc.fpstate = (kernel_fpstate_t *)new_fpstate;
     }
     convert_rt_mask_to_nonrt(f_new, &f_old->uc.uc_sigmask);
@@ -3253,7 +3320,17 @@ fixup_rtframe_pointers(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
     if (f_old->uc.uc_mcontext.fpstate != NULL) {
         uint frame_size = get_app_frame_size(info, sig);
         byte *frame_end = ((byte *)f_new) + frame_size;
+#    ifdef X64
         byte *tgt = (byte *)ALIGN_FORWARD(frame_end, XSTATE_ALIGNMENT);
+#    else
+        uint offset_fpstate_xsave = offsetof(kernel_fpstate_t, _fxsr_env);
+        /* i#5079: The kernel requires the xsave area to be 64-byte aligned, which
+         * starts at _fxsr_env in kernel_fpstate_t.
+         */
+        byte *tgt =
+            (byte *)ALIGN_FORWARD(frame_end + offset_fpstate_xsave, XSTATE_ALIGNMENT) -
+            offset_fpstate_xsave;
+#    endif
         size_t extra_size = signal_frame_extra_size(false);
         ASSERT(extra_size == f_new->uc.uc_mcontext.fpstate->sw_reserved.extended_size);
         /* XXX: It may be better to move this into memcpy_rt_frame (or another
@@ -3400,16 +3477,16 @@ copy_frame_to_stack(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
         /* We have no safe-read mechanism so we do the best we can: blindly copy. */
         if (rtframe)
             memcpy_rt_frame(frame, sp, from_pending);
-        IF_NOT_X64(IF_LINUX(
-            else convert_frame_to_nonrt(dcontext, sig, frame, (sigframe_plain_t *)sp);));
+        IF_NOT_X64(IF_LINUX(else convert_frame_to_nonrt(dcontext, sig, frame,
+                                                        (sigframe_plain_t *)sp, size);));
     } else {
         TRY_EXCEPT(dcontext, /* try */
                    {
                        if (rtframe)
                            memcpy_rt_frame(frame, sp, from_pending);
-                       IF_NOT_X64(
-                           IF_LINUX(else convert_frame_to_nonrt(
-                                        dcontext, sig, frame, (sigframe_plain_t *)sp);));
+                       IF_NOT_X64(IF_LINUX(
+                           else convert_frame_to_nonrt(dcontext, sig, frame,
+                                                       (sigframe_plain_t *)sp, size);));
                    },
                    /* except */ { stack_unwritable = true; });
     }

@@ -154,6 +154,19 @@ extract_uint(uint enc, int pos, int len)
     return enc >> pos & (((uint)1 << len) - 1);
 }
 
+/* Find the highest bit set in subfield, relative to the starting position. */
+static inline uint
+highest_bit_set(uint enc, int pos, int len, int *highest_bit)
+{
+    for (int i = pos + len - 1; i >= pos; i--) {
+        if (enc & (1 << i)) {
+            *highest_bit = i - pos;
+            return true;
+        }
+    }
+    return false;
+}
+
 static inline bool
 try_encode_int(OUT uint *bits, int len, int scale, ptr_int_t val)
 {
@@ -992,6 +1005,40 @@ encode_opnd_h_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
     return false;
 }
 
+/* b_const_sz: Operand size for byte elements
+ */
+static inline bool
+decode_opnd_b_const_sz(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_BYTE, OPSZ_2b);
+    return true;
+}
+
+static inline bool
+encode_opnd_b_const_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    if (opnd_get_immed_int(opnd) == VECTOR_ELEM_WIDTH_BYTE)
+        return true;
+    return false;
+}
+
+/* s_const_sz: Operand size for single (32-bit) element
+ */
+static inline bool
+decode_opnd_s_const_sz(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_SINGLE, OPSZ_2b);
+    return true;
+}
+
+static inline bool
+encode_opnd_s_const_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    if (opnd_get_immed_int(opnd) == VECTOR_ELEM_WIDTH_SINGLE)
+        return true;
+    return false;
+}
+
 /* nzcv: flag bit specifier for conditional compare */
 
 static inline bool
@@ -1437,6 +1484,60 @@ encode_opnd_imm4(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
     return encode_opnd_int(8, 4, false, 0, 0, opnd, enc_out);
 }
 
+#define CMODE_MSL_BIT 28
+
+/* cmode4_s_sz_msl: Operand for 32 bit elements' shift amount (shifting ones) */
+
+static inline bool
+decode_opnd_cmode4_s_sz_msl(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    /* cmode size shift amounts
+     * 110x  32   8,16
+     * This is an MSL (Modified Shift Left). Unlike an LSL (Logical Shift
+     * Left), this left shift shifts ones instead of zeros into the low order
+     * bits.
+     *
+     * The element size and shift amount are stored as two 32 bit numbers in
+     * sz_shft. This is a workaround until issue i#4393 is addressed.
+     */
+    const int cmode4 = extract_uint(enc, 12, 1);
+    const int size = 32;
+    const int shift = ((cmode4 == 0) ? 8 : 16) | (1U << CMODE_MSL_BIT);
+    uint64 sz_shft = ((uint64)size << 32) | shift;
+    *opnd = opnd_create_immed_int(sz_shft, OPSZ_8);
+    return true;
+}
+
+static inline bool
+encode_opnd_cmode4_s_sz_msl(uint enc, int opcode, byte *pc, opnd_t opnd,
+                            OUT uint *enc_out)
+{
+    if (!opnd_is_immed_int(opnd))
+        return false;
+
+    int64 sz_shft = opnd_get_immed_int(opnd);
+    int shift = (int)(sz_shft & 0xffffffff);
+    if (!TEST(1U << CMODE_MSL_BIT, shift)) // MSL bit should be set
+        return false;
+    shift &= 0xff;
+    const int size = (int)(sz_shft >> 32);
+
+    if (size != 32)
+        return false;
+
+    int cmode4;
+    if (shift == 8)
+        cmode4 = 0;
+    else if (shift == 16)
+        cmode4 = 1;
+    else
+        return false;
+
+    opnd = opnd_create_immed_uint(cmode4, OPSZ_1b);
+    encode_opnd_int(12, 1, false, false, 0, opnd, enc_out);
+    return true;
+}
+
 /* extam: extend amount, a left shift from 0 to 4 */
 
 static inline bool
@@ -1458,6 +1559,51 @@ encode_opnd_extam(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out
     return true;
 }
 
+/* cmode_h_sz: Operand for 16 bit elements' shift amount */
+
+static inline bool
+decode_opnd_cmode_h_sz(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    /* cmode size amounts
+     * 10x0  16   0,8
+     *
+     * The element size and shift amount are stored as two 32 bit numbers in
+     * sz_shft. This is a workaround until issue i#4393 is addressed.
+     */
+    const int cmode = extract_uint(enc, 13, 1);
+    int size = 16;
+    const int shift = (cmode == 0) ? 0 : 8;
+    const uint64 sz_shft = ((uint64)size << 32) | shift;
+    *opnd = opnd_create_immed_int(sz_shft, OPSZ_8);
+    return true;
+}
+
+static inline bool
+encode_opnd_cmode_h_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    if (!opnd_is_immed_int(opnd))
+        return false;
+
+    const int64 sz_shft = opnd_get_immed_int(opnd);
+    const int shift = (int)(sz_shft & 0xFF);
+    int size = (int)(sz_shft >> 32);
+
+    if (size != 16)
+        return false;
+
+    int cmode;
+    if (shift == 0)
+        cmode = 0;
+    else if (shift == 8)
+        cmode = 1;
+    else
+        return false;
+
+    opnd = opnd_create_immed_uint(cmode, OPSZ_1b);
+    encode_opnd_int(13, 1, false, false, 0, opnd, enc_out);
+    return true;
+}
+
 /* p10_low: P register at bit position 10; P0-P7 */
 
 static inline bool
@@ -1471,6 +1617,61 @@ static inline bool
 encode_opnd_p10_low(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
 {
     return encode_opnd_p(10, 7, opnd, enc_out);
+}
+
+/* cmode_s_sz: Operand for 32 bit elements' shift amount */
+
+static inline bool
+decode_opnd_cmode_s_sz(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    /* cmode size amounts
+     * 0xx0  32   0,8,16,24
+     *
+     * The element size and shift amount are stored as two 32 bit numbers in
+     * sz_shft. This is a workaround until issue i#4393 is addressed.
+     */
+    const int cmode = extract_uint(enc, 13, 2);
+    const int size = 32;
+    int shift;
+    switch (cmode) {
+    case 0: shift = 0; break;
+    case 1: shift = 8; break;
+    case 2: shift = 16; break;
+    case 3: shift = 24; break;
+    default: return false;
+    }
+    const uint64 sz_shft = ((uint64)size << 32) | shift;
+    *opnd = opnd_create_immed_int(sz_shft, OPSZ_8);
+    return true;
+}
+
+static inline bool
+encode_opnd_cmode_s_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    if (!opnd_is_immed_int(opnd))
+        return false;
+
+    const int64 sz_shft = opnd_get_immed_int(opnd);
+    const int shift = (int)(sz_shft & 0xffffffff);
+    if (TEST(1U << CMODE_MSL_BIT, shift)) // MSL bit should not be set as this is LSL
+        return false;
+    const int size = (int)(sz_shft >> 32);
+
+    if (size != 32)
+        return false;
+
+    int cmode;
+    switch (shift) {
+    case 0: cmode = 0; break;
+    case 8: cmode = 1; break;
+    case 16: cmode = 2; break;
+    case 24: cmode = 3; break;
+    default: return false;
+    }
+
+    opnd = opnd_create_immed_uint(cmode, OPSZ_2b);
+    encode_opnd_int(13, 2, false, false, 0, opnd, enc_out);
+    return true;
 }
 
 /* len: imm2 at bits 13 & 14 */
@@ -1588,6 +1789,34 @@ encode_opnd_q10(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
     return encode_opnd_vector_reg(10, 4, opnd, enc_out);
 }
 
+/* cmode4_b_sz : Operand for byte elements' shift amount
+ */
+static inline bool
+decode_opnd_cmode4_b_sz(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    /* cmode size shift amount
+     * 1110  8    0
+     *
+     * The element size and shift amount are stored as two 32 bit numbers in
+     * sz_shft. This is a workaround until issue i#4393 is addressed.
+     */
+    if ((enc & 0xf000) != 0xe000)
+        return false;
+    const int size = 8;
+    const uint64 sz_shft = (uint64)size << 32;
+    *opnd = opnd_create_immed_int(sz_shft, OPSZ_8);
+    return true;
+}
+
+static inline bool
+encode_opnd_cmode4_b_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    const int size = 8;
+    if (opnd_is_immed_int(opnd) && opnd_get_immed_int(opnd) == ((uint64)size << 32))
+        return true;
+    return false;
+}
+
 /* ext: extend type, dr_extend_type_t */
 
 static inline bool
@@ -1602,27 +1831,7 @@ encode_opnd_ext(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
     return encode_opnd_int(13, 3, false, 0, DR_OPND_IS_EXTEND, opnd, enc_out);
 }
 
-/* cmode3: 3 bit int decoded from bits 13-15 */
-
-static inline bool
-decode_opnd_cmode3(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
-{
-    int value = extract_uint(enc, 13, 3);
-    *opnd = opnd_create_immed_uint(value, OPSZ_3b);
-    return true;
-}
-
-static inline bool
-encode_opnd_cmode3(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
-{
-    if (!opnd_is_immed_int(opnd))
-        return false;
-    int value = opnd_get_immed_int(opnd);
-    opnd = opnd_create_immed_uint(value, OPSZ_3b);
-    return encode_opnd_int(13, 3, false, false, 0, opnd, enc_out);
-}
-
-/* crn: 4-bit immediate from bits 12-15*/
+/* crn: 4-bit immediate from bits 12-15 */
 
 static inline bool
 decode_opnd_crn(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
@@ -1909,7 +2118,6 @@ get_imm5_offset(int val)
             return i;
         }
     }
-    ASSERT(false);
     return -1;
 }
 
@@ -2410,35 +2618,6 @@ encode_opnd_vindex_H(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_
     return true;
 }
 
-
-/* immhb: The vector encoding of #fbits operand. This is the number of bits
- * after the decimal point for fixed-point values.
- */
-static inline bool
-decode_opnd_immhb(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
-{
-    uint immhb = extract_uint(enc, 16, 6);
-    *opnd = opnd_create_immed_int(64 - immhb, OPSZ_6b);
-    return true;
-}
-
-static inline bool
-encode_opnd_immhb(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
-{
-    ptr_int_t fbits;
-
-    if (!opnd_is_immed_int(opnd))
-        return false;
-
-    fbits = opnd_get_immed_int(opnd);
-    if (fbits < 1 || fbits > 64)
-        return false;
-
-    *enc_out = (64 - fbits) << 16;
-
-    return true;
-}
-
 /* imm12: 12-bit immediate operand of ADD/SUB */
 
 static inline bool
@@ -2479,6 +2658,167 @@ static inline bool
 encode_opnd_prf12(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
 {
     return encode_opnd_mem12_scale(3, true, opnd, enc_out);
+}
+
+/* hsd_immh_sz: The element size of a vector mediated by immh with possible values h, s
+ * and d
+ */
+static inline bool
+decode_opnd_hsd_immh_sz(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    int highest_bit;
+    if (!highest_bit_set(enc, 19, 4, &highest_bit))
+        return false;
+
+    switch (highest_bit) {
+    case 0: *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_HALF, OPSZ_2b); break;
+    case 1: *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_SINGLE, OPSZ_2b); break;
+    case 2: *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_DOUBLE, OPSZ_2b); break;
+    default: return false;
+    }
+    return true;
+}
+
+static inline bool
+encode_opnd_hsd_immh_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return true;
+}
+
+/* bhsd_immh_sz: The element size of a vector mediated by immh with possible values b, h,
+ * s and d
+ */
+static inline bool
+decode_opnd_bhsd_immh_sz(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    int highest_bit;
+    if (!highest_bit_set(enc, 19, 4, &highest_bit))
+        return false;
+
+    switch (highest_bit) {
+    case 0: *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_BYTE, OPSZ_2b); break;
+    case 1: *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_HALF, OPSZ_2b); break;
+    case 2: *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_SINGLE, OPSZ_2b); break;
+    case 3: *opnd = opnd_create_immed_int(VECTOR_ELEM_WIDTH_DOUBLE, OPSZ_2b); break;
+    default: return false;
+    }
+    return true;
+}
+
+static inline bool
+encode_opnd_bhsd_immh_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return true;
+}
+
+static inline bool
+decode_hsd_immh_regx(int rpos, uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    int highest_bit;
+    if (!highest_bit_set(enc, 19, 4, &highest_bit))
+        return false;
+
+    if (highest_bit < 0 || highest_bit > 2)
+        return false;
+
+    return decode_opnd_vector_reg(rpos, highest_bit + 1, enc, opnd);
+}
+
+static inline bool
+encode_hsd_immh_regx(int rpos, uint enc, int opcode, byte *pc, opnd_t opnd,
+                     OUT uint *enc_out)
+{
+    if (!opnd_is_reg(opnd))
+        return false;
+    reg_t reg = opnd_get_reg(opnd);
+    if (reg >= DR_REG_D0 && reg <= DR_REG_D31)
+        return encode_opnd_vector_reg(rpos, 3, opnd, enc_out);
+    else if (reg >= DR_REG_S0 && reg <= DR_REG_S31)
+        return encode_opnd_vector_reg(rpos, 2, opnd, enc_out);
+    else if (reg >= DR_REG_H0 && reg <= DR_REG_H31)
+        return encode_opnd_vector_reg(rpos, 1, opnd, enc_out);
+    else
+        return false;
+}
+
+static inline bool
+decode_bhsd_immh_regx(int rpos, uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    int highest_bit;
+    if (!highest_bit_set(enc, 19, 4, &highest_bit))
+        return false;
+
+    if (highest_bit < 0 || highest_bit > 3)
+        return false;
+
+    return decode_opnd_vector_reg(rpos, highest_bit, enc, opnd);
+}
+
+static inline bool
+encode_bhsd_immh_regx(int rpos, uint enc, int opcode, byte *pc, opnd_t opnd,
+                      OUT uint *enc_out)
+{
+    if (!opnd_is_reg(opnd))
+        return false;
+    reg_t reg = opnd_get_reg(opnd);
+    if (reg >= DR_REG_D0 && reg <= DR_REG_D31)
+        return encode_opnd_vector_reg(rpos, 3, opnd, enc_out);
+    else if (reg >= DR_REG_S0 && reg <= DR_REG_S31)
+        return encode_opnd_vector_reg(rpos, 2, opnd, enc_out);
+    else if (reg >= DR_REG_H0 && reg <= DR_REG_H31)
+        return encode_opnd_vector_reg(rpos, 1, opnd, enc_out);
+    else if (reg >= DR_REG_B0 && reg <= DR_REG_B31)
+        return encode_opnd_vector_reg(rpos, 0, opnd, enc_out);
+    else
+        return false;
+}
+
+static inline bool
+decode_opnd_hsd_immh_reg0(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_hsd_immh_regx(0, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_hsd_immh_reg0(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_hsd_immh_regx(0, enc, opcode, pc, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_bhsd_immh_reg0(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_bhsd_immh_regx(0, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_bhsd_immh_reg0(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_bhsd_immh_regx(0, enc, opcode, pc, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_hsd_immh_reg5(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_hsd_immh_regx(5, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_hsd_immh_reg5(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_hsd_immh_regx(5, enc, opcode, pc, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_bhsd_immh_reg5(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_bhsd_immh_regx(5, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_bhsd_immh_reg5(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_bhsd_immh_regx(5, enc, opcode, pc, opnd, enc_out);
 }
 
 /* vindex_SD: Index for vector with single or double elements. */
@@ -2582,6 +2922,117 @@ encode_opnd_sd_sz(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out
         return true;
     }
     return false;
+}
+
+static inline bool
+immhb_shf_decode(uint enc, int opcode, byte *pc, OUT opnd_t *opnd, uint min_shift)
+{
+    int highest_bit;
+    if (!highest_bit_set(enc, 19, 4, &highest_bit))
+        return false;
+
+    uint esize = 8 << highest_bit;
+    uint immhb_shf = extract_uint(enc, 16, 4 + highest_bit);
+    opnd_size_t shift_size;
+    switch (highest_bit) {
+    case 0: shift_size = OPSZ_3b; break;
+    case 1: shift_size = OPSZ_4b; break;
+    case 2: shift_size = OPSZ_5b; break;
+    case 3: shift_size = OPSZ_6b; break;
+    default: return false;
+    }
+
+    if (min_shift == 1)
+        *opnd = opnd_create_immed_int((2 * esize) - immhb_shf, shift_size);
+    else if (min_shift == 0)
+        *opnd = opnd_create_immed_int(immhb_shf - esize, shift_size);
+    else
+        return false;
+
+    opnd_add_flags(*opnd, DR_OPND_IS_SHIFT);
+    return true;
+}
+
+static inline bool
+immhb_shf_encode(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out,
+                 uint min_shift)
+{
+    opnd_size_t shift_size = opnd_get_size(opnd);
+    uint highest_bit;
+    switch (shift_size) {
+    case OPSZ_3b: highest_bit = 0; break;
+    case OPSZ_4b: highest_bit = 1; break;
+    case OPSZ_5b: highest_bit = 2; break;
+    case OPSZ_6b: highest_bit = 3; break;
+    default: return false;
+    }
+    ptr_int_t shift_amount;
+    uint esize = 8 << highest_bit;
+
+    if (!opnd_is_immed_int(opnd))
+        return false;
+
+    shift_amount = opnd_get_immed_int(opnd);
+
+    uint shift_encoding, max_shift;
+    if (min_shift == 0) {
+        shift_encoding = shift_amount + esize;
+        max_shift = esize - 1;
+    } else if (min_shift == 1) {
+        shift_encoding = esize * 2 - shift_amount;
+        max_shift = esize;
+    } else
+        return false;
+
+    if (shift_amount < min_shift || shift_amount > max_shift)
+        return false;
+
+    *enc_out = (shift_encoding << 16);
+
+    return true;
+}
+
+/* immhb_shf: The vector encoding of #shift operand.
+ */
+static inline bool
+decode_opnd_immhb_shf(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return immhb_shf_decode(enc, opcode, pc, opnd, 1);
+}
+
+static inline bool
+encode_opnd_immhb_shf(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return immhb_shf_encode(enc, opcode, pc, opnd, enc_out, 1);
+}
+
+/* immhb_shf2: The vector encoding of #shift operand.
+ */
+static inline bool
+decode_opnd_immhb_0shf(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return immhb_shf_decode(enc, opcode, pc, opnd, 0);
+}
+
+static inline bool
+encode_opnd_immhb_0shf(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return immhb_shf_encode(enc, opcode, pc, opnd, enc_out, 0);
+}
+
+/* immhb_fxp: The vector encoding of #fbits operand. This is the number of bits
+ * after the decimal point for fixed-point values.
+ */
+static inline bool
+decode_opnd_immhb_fxp(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return immhb_shf_decode(enc, opcode, pc, opnd, 1);
+}
+
+static inline bool
+encode_opnd_immhb_fxp(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return immhb_shf_encode(enc, opcode, pc, opnd, enc_out, 1);
 }
 
 /* fpimm13: floating-point immediate for scalar fmov */
@@ -2867,6 +3318,65 @@ encode_opnd_shift4(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_ou
 }
 
 static inline bool
+decode_hsd_size_regx(int rpos, uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    uint size = extract_uint(enc, 22, 2);
+
+    if (size < 0 || size > 2)
+        return false;
+
+    return decode_opnd_vector_reg(rpos, size + 1, enc, opnd);
+}
+
+static inline bool
+encode_hsd_size_regx(int rpos, uint enc, int opcode, byte *pc, opnd_t opnd,
+                     OUT uint *enc_out)
+{
+    if (!opnd_is_reg(opnd))
+        return false;
+
+    reg_t reg = opnd_get_reg(opnd);
+    if (reg >= DR_REG_D0 && reg <= DR_REG_D31)
+        return encode_opnd_vector_reg(rpos, 3, opnd, enc_out);
+    else if (reg >= DR_REG_S0 && reg <= DR_REG_S31)
+        return encode_opnd_vector_reg(rpos, 2, opnd, enc_out);
+    else if (reg >= DR_REG_H0 && reg <= DR_REG_H31)
+        return encode_opnd_vector_reg(rpos, 1, opnd, enc_out);
+    else
+        return false;
+}
+
+static inline bool
+decode_bhsd_size_regx(int rpos, uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    uint size = extract_uint(enc, 22, 2);
+
+    if (size < 0 || size > 3)
+        return false;
+
+    return decode_opnd_vector_reg(rpos, size, enc, opnd);
+}
+
+static inline bool
+encode_bhsd_size_regx(int rpos, uint enc, int opcode, byte *pc, opnd_t opnd,
+                      OUT uint *enc_out)
+{
+    if (!opnd_is_reg(opnd))
+        return false;
+    reg_t reg = opnd_get_reg(opnd);
+    if (reg >= DR_REG_D0 && reg <= DR_REG_D31)
+        return encode_opnd_vector_reg(rpos, 3, opnd, enc_out);
+    else if (reg >= DR_REG_S0 && reg <= DR_REG_S31)
+        return encode_opnd_vector_reg(rpos, 2, opnd, enc_out);
+    else if (reg >= DR_REG_H0 && reg <= DR_REG_H31)
+        return encode_opnd_vector_reg(rpos, 1, opnd, enc_out);
+    else if (reg >= DR_REG_B0 && reg <= DR_REG_B31)
+        return encode_opnd_vector_reg(rpos, 0, opnd, enc_out);
+    else
+        return false;
+}
+
+static inline bool
 decode_opnd_float_reg0(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
 {
     return decode_opnd_float_reg(0, enc, opnd);
@@ -2879,6 +3389,30 @@ encode_opnd_float_reg0(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *en
 }
 
 static inline bool
+decode_opnd_hsd_size_reg0(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_hsd_size_regx(0, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_hsd_size_reg0(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_hsd_size_regx(0, enc, opcode, pc, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_bhsd_size_reg0(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_bhsd_size_regx(0, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_bhsd_size_reg0(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_bhsd_size_regx(0, enc, opcode, pc, opnd, enc_out);
+}
+
+static inline bool
 decode_opnd_float_reg5(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
 {
     return decode_opnd_float_reg(5, enc, opnd);
@@ -2888,6 +3422,30 @@ static inline bool
 encode_opnd_float_reg5(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
 {
     return encode_opnd_float_reg(5, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_hsd_size_reg5(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_hsd_size_regx(5, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_hsd_size_reg5(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_hsd_size_regx(5, enc, opcode, pc, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_bhsd_size_reg5(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_bhsd_size_regx(5, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_bhsd_size_reg5(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_bhsd_size_regx(5, enc, opcode, pc, opnd, enc_out);
 }
 
 static inline bool
@@ -2912,6 +3470,31 @@ static inline bool
 encode_opnd_float_reg16(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
 {
     return encode_opnd_float_reg(16, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_hsd_size_reg16(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_hsd_size_regx(16, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_hsd_size_reg16(uint enc, int opcode, byte *pc, opnd_t opnd, OUT uint *enc_out)
+{
+    return encode_hsd_size_regx(16, enc, opcode, pc, opnd, enc_out);
+}
+
+static inline bool
+decode_opnd_bhsd_size_reg16(uint enc, int opcode, byte *pc, OUT opnd_t *opnd)
+{
+    return decode_bhsd_size_regx(16, enc, opcode, pc, opnd);
+}
+
+static inline bool
+encode_opnd_bhsd_size_reg16(uint enc, int opcode, byte *pc, opnd_t opnd,
+                            OUT uint *enc_out)
+{
+    return encode_bhsd_size_regx(16, enc, opcode, pc, opnd, enc_out);
 }
 
 /* mem0p: as mem0, but a pair of registers, so double size */
