@@ -61,6 +61,7 @@
 #endif
 
 #define OUTFILE_SUFFIX "raw"
+#define WARMUPFILE_SUFFIX "warmup.raw"
 #ifdef HAS_ZLIB
 #    define OUTFILE_SUFFIX_GZ "raw.gz"
 #endif
