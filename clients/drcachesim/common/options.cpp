@@ -375,7 +375,7 @@ droption_t<bytesize_t>
                  "These memory references are dropped instead of being simulated.");
 
 droption_t<bytesize_t> op_warmup_refs(
-    DROPTION_SCOPE_FRONTEND, "warmup_refs", 0,
+    DROPTION_SCOPE_CLIENT, "warmup_refs", 0,
     "Number of memory references to warm caches up",
     "Specifies the number of memory references to warm up caches before simulation. "
     "The warmup references come after the skipped references and before the "

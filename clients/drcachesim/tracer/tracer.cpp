@@ -97,6 +97,7 @@ static char subdir_prefix[MAXIMUM_PATH]; /* Holds op_subdir_prefix. */
 static file_t module_file;
 static file_t funclist_file = INVALID_FILE;
 static int notify_beyond_global_max_once;
+static int notify_beyond_max_trace_size_once;
 
 /* Max number of entries a buffer can have. It should be big enough
  * to hold all entries between clean calls.
@@ -129,6 +130,7 @@ typedef struct {
     /* For level 0 filters */
     byte *l0_dcache;
     byte *l0_icache;
+    uint64 warmup_refs;
 } per_thread_t;
 
 #define MAX_NUM_DELAY_INSTRS 32
@@ -192,6 +194,10 @@ static size_t buf_hdr_slots_size;
 static bool (*should_trace_thread_cb)(thread_id_t tid, void *user_data);
 static void *trace_thread_cb_user_data;
 static bool thread_filtering_enabled;
+static bool skip_some_processes = true;
+
+static void enable_tracing_instrumentation();
+static void disable_tracing_instrumentation();
 
 /***************************************************************************
  * Buffer writing to disk.
@@ -408,7 +414,46 @@ is_bytes_written_beyond_trace_max(per_thread_t *data)
 }
 
 static void
-memtrace(void *drcontext, bool skip_size_cap)
+open_post_trace(void *drcontext)
+{
+    per_thread_t *data = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    DR_ASSERT(data);
+    NOTIFY(0, "In open_post_trace.\n");
+
+    byte *buf_ptr = BUF_PTR(data->seg_base);
+    BUF_PTR(data->seg_base) +=
+        instru->append_thread_exit(BUF_PTR(data->seg_base), dr_get_thread_id(drcontext));
+    write_trace_data(drcontext, buf_ptr, BUF_PTR(data->seg_base));
+
+    char buf[MAXIMUM_PATH];
+    uint flags =
+        IF_UNIX(DR_FILE_CLOSE_ON_FORK |) DR_FILE_ALLOW_LARGE | DR_FILE_WRITE_REQUIRE_NEW;
+    file_ops_func.close_file(data->file);
+    file_t f = drx_open_unique_appid_file(
+        logsubdir, dr_get_thread_id(drcontext), subdir_prefix, OUTFILE_SUFFIX,
+        DRX_FILE_SKIP_OPEN, buf, BUFFER_SIZE_ELEMENTS(buf));
+    // with DRX_FILE_SKIP_OPEN file won't be opened
+    DR_ASSERT(f == INVALID_FILE);
+    NULL_TERMINATE_BUFFER(buf);
+    data->file = file_ops_func.open_file(buf, flags);
+    DR_ASSERT(data->file != INVALID_FILE);
+
+    instru->clear_memref_needs_info();
+    offline_file_type_t file_type = OFFLINE_FILE_TYPE_DEFAULT;
+    file_type = static_cast<offline_file_type_t>(
+        file_type |
+        IF_X86_ELSE(
+            IF_X64_ELSE(OFFLINE_FILE_TYPE_ARCH_X86_64, OFFLINE_FILE_TYPE_ARCH_X86_32),
+            IF_X64_ELSE(OFFLINE_FILE_TYPE_ARCH_AARCH64, OFFLINE_FILE_TYPE_ARCH_ARM32)));
+    data->init_header_size =
+        reinterpret_cast<offline_instru_t *>(instru)->append_thread_header(
+            data->buf_base, dr_get_thread_id(drcontext), file_type);
+    BUF_PTR(data->seg_base) =
+        data->buf_base + data->init_header_size + buf_hdr_slots_size;
+}
+
+static void
+memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
 {
     per_thread_t *data = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     byte *mem_ref, *buf_ptr;
@@ -430,7 +475,7 @@ memtrace(void *drcontext, bool skip_size_cap)
                                               dr_get_thread_id(drcontext));
     pipe_start = data->buf_base;
     pipe_end = pipe_start;
-    if (!skip_size_cap &&
+    if (!skip_size_cap && !data->warmup_refs &&
         (is_bytes_written_beyond_trace_max(data) || is_num_refs_beyond_global_max())) {
         /* We don't guarantee to match the limit exactly so we allow one buffer
          * beyond.  We also don't put much effort into reducing overhead once
@@ -445,6 +490,14 @@ memtrace(void *drcontext, bool skip_size_cap)
                 int count = dr_atomic_add32_return_sum(&notify_beyond_global_max_once, 1);
                 if (count == 1) {
                     NOTIFY(0, "Hit -max_global_trace_refs: disabling tracing.\n");
+                }
+            }
+        }
+        else if (is_bytes_written_beyond_trace_max(data)) {
+            if (dr_atomic_load32(&notify_beyond_max_trace_size_once) == 0) {
+                int count = dr_atomic_add32_return_sum(&notify_beyond_max_trace_size_once, 1);
+                if (count == 1) {
+                    NOTIFY(0, "Hit -max_trace_size: disabling tracing.\n");
                 }
             }
         }
@@ -539,8 +592,54 @@ memtrace(void *drcontext, bool skip_size_cap)
     }
     BUF_PTR(data->seg_base) = data->buf_base + buf_hdr_slots_size;
     num_refs_racy += current_num_refs;
-    if (op_exit_after_tracing.get_value() > 0 &&
-        num_refs_racy > op_exit_after_tracing.get_value()) {
+    if (next_pc && data->warmup_refs > 0 && data->num_refs > data->warmup_refs) {
+        // dr_mutex_lock(mutex);
+        NOTIFY(0,
+               "Thread " UINT64_FORMAT_STRING
+               ": Switching to full trace after ~" UINT64_FORMAT_STRING
+               " references for this thread (global references = " UINT64_FORMAT_STRING
+               ").\n",
+               dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
+        num_refs_racy = 0;
+        data->warmup_refs = 0;
+        data->num_refs = 0;
+        data->bytes_written = 0;
+        //dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
+        op_warmup_refs.set_value(0);
+        op_L0_filter.set_value(0);
+#if 1
+        disable_tracing_instrumentation();
+        open_post_trace(drcontext);
+        if (!dr_unlink_flush_region(NULL, ~0UL))
+                DR_ASSERT(false);
+        enable_tracing_instrumentation();
+#else
+        void *drcontext = dr_get_current_drcontext();
+        dr_mcontext_t mcontext;
+        mcontext.size = sizeof(mcontext);
+        mcontext.flags = DR_MC_ALL;
+        dr_get_mcontext(drcontext, &mcontext);
+        if (next_pc)
+            mcontext.pc = dr_app_pc_as_jump_target(dr_get_isa_mode(drcontext), next_pc);
+        else
+            mcontext.pc = dr_app_pc_as_jump_target(dr_get_isa_mode(drcontext), mcontext.pc);
+//mcontext.xcx = *(uint64_t*)(data->seg_base + 0xe8);
+//mcontext.rcx = *(uint64_t*)(data->seg_base + 0xe8);
+        NOTIFY(0,
+               "Thread " UINT64_FORMAT_STRING
+               ": rcx = " HEX64_FORMAT_STRING
+               ": xcx = " HEX64_FORMAT_STRING
+               "  rdx = " HEX64_FORMAT_STRING
+               "  xdx = " HEX64_FORMAT_STRING
+               ").\n",
+               dr_get_thread_id(drcontext), mcontext.rcx, mcontext.xcx, mcontext.rdx, mcontext.xdx);
+        dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
+        dr_redirect_execution(&mcontext);
+        DR_ASSERT(false);
+#endif
+        // dr_mutex_unlock(mutex);
+    } else if (op_exit_after_tracing.get_value() > 0 &&
+               num_refs_racy > op_exit_after_tracing.get_value()) {
         dr_mutex_lock(mutex);
         if (!exited_process) {
             exited_process = true;
@@ -548,8 +647,10 @@ memtrace(void *drcontext, bool skip_size_cap)
             // XXX i#2644: we would prefer detach_after_tracing rather than exiting
             // the process but that requires a client-triggered detach so for now
             // we settle for exiting.
-            NOTIFY(0, "Exiting process after ~" UINT64_FORMAT_STRING " references.\n",
-                   num_refs_racy);
+            NOTIFY(0,
+                   "Thread " UINT64_FORMAT_STRING
+                   ": Exiting process after ~" UINT64_FORMAT_STRING " references.\n",
+                   dr_get_thread_id(drcontext), num_refs_racy);
             dr_exit_process(0);
         }
         dr_mutex_unlock(mutex);
@@ -558,10 +659,10 @@ memtrace(void *drcontext, bool skip_size_cap)
 
 /* clean_call sends the memory reference info to the simulator */
 static void
-clean_call(void)
+clean_call(app_pc next_pc)
 {
     void *drcontext = dr_get_current_drcontext();
-    memtrace(drcontext, false);
+    memtrace(drcontext, false, next_pc);
 }
 
 /***************************************************************************
@@ -584,7 +685,7 @@ append_marker_seg_base(void *drcontext, func_trace_entry_vector_t *vec)
      * be a litte safer in case that changes we also do a redzone check here.
      */
     if (BUF_PTR(data->seg_base) - data->buf_base > static_cast<ssize_t>(trace_buf_size))
-        memtrace(drcontext, false);
+        memtrace(drcontext, false, 0);
 }
 
 static void
@@ -782,8 +883,10 @@ instrument_clean_call(void *drcontext, instrlist_t *ilist, instr_t *where,
                               OPND_CREATE_MEMPTR(reg_ptr, 0)));
     reg_id_t reg_tmp = insert_conditional_skip(drcontext, ilist, where, reg_ptr,
                                                skip_call, short_reaches);
-    dr_insert_clean_call_ex(drcontext, ilist, where, (void *)clean_call,
-                            DR_CLEANCALL_ALWAYS_OUT_OF_LINE, 0);
+    //dr_insert_clean_call_ex(drcontext, ilist, where, (void *)clean_call,
+    //                        DR_CLEANCALL_ALWAYS_OUT_OF_LINE, 0);
+    dr_insert_clean_call_ex(drcontext, ilist, where, (void *)clean_call, DR_CLEANCALL_ALWAYS_OUT_OF_LINE, 1,
+                         OPND_CREATE_INTPTR((ptr_uint_t)instr_get_app_pc(where)));
     insert_conditional_skip_target(drcontext, ilist, where, skip_call, reg_tmp,
                                    DR_REG_NULL);
     insert_conditional_skip_target(drcontext, ilist, where, skip_thread, reg_thread,
@@ -1297,7 +1400,7 @@ event_pre_syscall(void *drcontext, int sysnum)
     }
 #endif
     if (file_ops_func.handoff_buf == NULL)
-        memtrace(drcontext, false);
+        memtrace(drcontext, false, 0);
     return true;
 }
 
@@ -1345,7 +1448,7 @@ event_kernel_xfer(void *drcontext, const dr_kernel_xfer_info_t *info)
     BUF_PTR(data->seg_base) +=
         instru->append_marker(BUF_PTR(data->seg_base), marker_type, marker_val);
     if (file_ops_func.handoff_buf == NULL)
-        memtrace(drcontext, false);
+        memtrace(drcontext, false, 0);
 }
 
 /***************************************************************************
@@ -1409,6 +1512,18 @@ exit_delay_instrumentation()
 }
 
 static void
+disable_tracing_instrumentation()
+{
+    dr_unregister_filter_syscall_event(event_filter_syscall);
+    if (!drmgr_unregister_pre_syscall_event(event_pre_syscall) ||
+            !drmgr_unregister_kernel_xfer_event(event_kernel_xfer) ||
+            !drmgr_unregister_bb_instrumentation_ex_event(
+                event_bb_app2app, event_bb_analysis, event_app_instruction,
+                event_bb_instru2instru))
+        DR_ASSERT(false);
+}
+
+static void
 enable_tracing_instrumentation()
 {
     if (!drmgr_register_pre_syscall_event(event_pre_syscall) ||
@@ -1424,7 +1539,12 @@ enable_tracing_instrumentation()
 static void
 change_instrumentation_callback(void *unused_user_data)
 {
-    NOTIFY(0, "Hit delay threshold: enabling tracing.\n");
+    void *drcontext = dr_get_current_drcontext();
+    NOTIFY(0,
+           "Thread " UINT64_FORMAT_STRING
+           ": Hit delay threshold: enabling tracing after " UINT64_FORMAT_STRING
+           " instructions).\n",
+           dr_get_thread_id(drcontext), instr_count);
     disable_delay_instrumentation();
     enable_tracing_instrumentation();
 }
@@ -1646,9 +1766,10 @@ init_thread_in_process(void *drcontext)
          * Abort if we fail too many times.
          */
         for (i = 0; i < NUM_OF_TRIES; i++) {
-            drx_open_unique_appid_file(logsubdir, dr_get_thread_id(drcontext),
-                                       subdir_prefix, OUTFILE_SUFFIX, DRX_FILE_SKIP_OPEN,
-                                       buf, BUFFER_SIZE_ELEMENTS(buf));
+            drx_open_unique_appid_file(
+                logsubdir, dr_get_thread_id(drcontext), subdir_prefix,
+                op_warmup_refs.get_value() ? WARMUPFILE_SUFFIX : OUTFILE_SUFFIX,
+                DRX_FILE_SKIP_OPEN, buf, BUFFER_SIZE_ELEMENTS(buf));
             NULL_TERMINATE_BUFFER(buf);
             data->file = file_ops_func.open_file(buf, flags);
             if (data->file != INVALID_FILE)
@@ -1707,7 +1828,13 @@ event_thread_init(void *drcontext)
     DR_ASSERT(data != NULL);
     memset(data, 0, sizeof(*data));
     drmgr_set_tls_field(drcontext, tls_idx, data);
+    NOTIFY(0,
+           "Thread " UINT64_FORMAT_STRING
+           ": started (global references " UINT64_FORMAT_STRING ")\n",
+           dr_get_thread_id(drcontext), num_refs_racy);
 
+    if (op_warmup_refs.get_value())
+        data->warmup_refs = op_warmup_refs.get_value();
     /* Keep seg_base in a per-thread data structure so we can get the TLS
      * slot and find where the pointer points to in the buffer.
      */
@@ -1730,6 +1857,12 @@ static void
 event_thread_exit(void *drcontext)
 {
     per_thread_t *data = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    NOTIFY(0,
+           "Thread " UINT64_FORMAT_STRING ": exiting after ~" UINT64_FORMAT_STRING
+           " references (global references = " UINT64_FORMAT_STRING ").\n",
+           dr_get_thread_id(drcontext), data ? data->num_refs : 0, num_refs_racy);
+    if (!data)
+        return;
     if (BUF_PTR(data->seg_base) != NULL) {
         /* This thread was *not* filtered out. */
 
@@ -1759,7 +1892,7 @@ event_thread_exit(void *drcontext)
                  /* If this thread already wrote some data, include its exit even
                   * if we're over a size limit.
                   */
-                 data->bytes_written > 0);
+                 data->bytes_written > 0, 0);
 
         if (op_offline.get_value())
             file_ops_func.close_file(data->file);
@@ -1796,6 +1929,13 @@ event_exit(void)
            "drmemtrace exiting process " PIDFMT "; traced " UINT64_FORMAT_STRING
            " references.\n",
            dr_get_process_id(), num_refs);
+    if (!instru) { // skip_some_processes
+        drvector_delete(&scratch_reserve_vec);
+        drreg_exit();
+        drutil_exit();
+        drmgr_exit();
+        return;
+    }
     /* we use placement new for better isolation */
     instru->~instru_t();
     dr_global_free(instru, MAX_INSTRU_SIZE);
@@ -1911,10 +2051,26 @@ init_offline_dir(void)
     return (module_file != INVALID_FILE && funclist_file != INVALID_FILE);
 }
 
+static bool
+should_skip_process (const char * str)
+{
+  const char * procs_to_skip[] = { "bash", "dash", "numactl", "specinvoke" };
+  int num_procs = sizeof (procs_to_skip) / sizeof (procs_to_skip[0]);
+
+  for (int i = 0; i < num_procs; i++)
+    if (strcmp(str, procs_to_skip[i]) == 0)
+      return true;
+  return false;
+}
+
 #ifdef UNIX
 static void
 fork_init(void *drcontext)
 {
+    if (skip_some_processes)
+        if (should_skip_process(dr_get_application_name())) {
+            return;
+        }
     /* We use DR_FILE_CLOSE_ON_FORK, and we dumped outstanding data prior to the
      * fork syscall, so we just need to create a new subdir, new module log, and
      * a new initial thread file for offline, or register the new process for
@@ -1963,6 +2119,16 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
                (op_record_heap.get_value() || !op_record_function.get_value().empty())) {
         FATAL("Usage error: function recording is only supported for -offline\n");
     }
+    if (op_warmup_refs.get_value()) {
+        DR_ASSERT(!op_L0_filter.get_value());
+        if (op_L0_filter.get_value()) {
+            FATAL("Usage error: cannot use -L0_filter with -warmup.");
+        }
+        if (op_exit_after_tracing.get_value()) {
+            FATAL("Usage error: -warmup does not currently support -exit_after_tracing.");
+        }
+        op_L0_filter.set_value(op_warmup_refs.get_value());
+    }
     if (op_L0_filter.get_value() &&
         ((!IS_POWER_OF_2(op_L0I_size.get_value()) && op_L0I_size.get_value() != 0) ||
          (!IS_POWER_OF_2(op_L0D_size.get_value()) && op_L0D_size.get_value() != 0))) {
@@ -1979,15 +2145,18 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
 
     if (op_offline.get_value()) {
         void *placement;
-        if (!init_offline_dir()) {
-            FATAL("Failed to create a subdir in %s\n", op_outdir.get_value().c_str());
+        if (!skip_some_processes || 
+               !should_skip_process(dr_get_application_name())) {
+            if (!init_offline_dir()) {
+                FATAL("Failed to create a subdir in %s\n", op_outdir.get_value().c_str());
+            }
+            /* we use placement new for better isolation */
+            DR_ASSERT(MAX_INSTRU_SIZE >= sizeof(offline_instru_t));
+            placement = dr_global_alloc(MAX_INSTRU_SIZE);
+            instru = new (placement) offline_instru_t(
+                    insert_load_buf_ptr, op_L0_filter.get_value(), &scratch_reserve_vec,
+                    file_ops_func.write_file, module_file, op_disable_optimizations.get_value());
         }
-        /* we use placement new for better isolation */
-        DR_ASSERT(MAX_INSTRU_SIZE >= sizeof(offline_instru_t));
-        placement = dr_global_alloc(MAX_INSTRU_SIZE);
-        instru = new (placement) offline_instru_t(
-            insert_load_buf_ptr, op_L0_filter.get_value(), &scratch_reserve_vec,
-            file_ops_func.write_file, module_file, op_disable_optimizations.get_value());
         if (op_use_physical.get_value()) {
             /* TODO i#4014: Add support for this combination. */
             FATAL("Usage error: -offline does not currently support -use_physical.");
@@ -2042,6 +2211,11 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
 #ifdef UNIX
     dr_register_fork_init_event(fork_init);
 #endif
+    if (!instru) {
+        /* skip_some_processes */
+        return;
+    }
+
     if (!drmgr_register_thread_init_event(event_thread_init) ||
         !drmgr_register_thread_exit_event(event_thread_exit))
         DR_ASSERT(false);

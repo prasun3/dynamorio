@@ -192,6 +192,12 @@ public:
         return instr_size_;
     }
 
+    void
+    clear_memref_needs_info()
+    {
+      memref_needs_full_info_ = false;
+    }
+
     virtual trace_type_t
     get_entry_type(byte *buf_ptr) const = 0;
     virtual size_t
