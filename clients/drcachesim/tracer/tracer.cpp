@@ -196,8 +196,10 @@ static void *trace_thread_cb_user_data;
 static bool thread_filtering_enabled;
 static bool skip_some_processes = true;
 
-static void enable_tracing_instrumentation();
-static void disable_tracing_instrumentation();
+static void
+enable_tracing_instrumentation();
+static void
+disable_tracing_instrumentation();
 
 /***************************************************************************
  * Buffer writing to disk.
@@ -492,10 +494,10 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
                     NOTIFY(0, "Hit -max_global_trace_refs: disabling tracing.\n");
                 }
             }
-        }
-        else if (is_bytes_written_beyond_trace_max(data)) {
+        } else if (is_bytes_written_beyond_trace_max(data)) {
             if (dr_atomic_load32(&notify_beyond_max_trace_size_once) == 0) {
-                int count = dr_atomic_add32_return_sum(&notify_beyond_max_trace_size_once, 1);
+                int count =
+                    dr_atomic_add32_return_sum(&notify_beyond_max_trace_size_once, 1);
                 if (count == 1) {
                     NOTIFY(0, "Hit -max_trace_size: disabling tracing.\n");
                 }
@@ -604,14 +606,14 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
         data->warmup_refs = 0;
         data->num_refs = 0;
         data->bytes_written = 0;
-        //dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
+        // dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
         op_warmup_refs.set_value(0);
         op_L0_filter.set_value(0);
 #if 1
         disable_tracing_instrumentation();
         open_post_trace(drcontext);
         if (!dr_unlink_flush_region(NULL, ~0UL))
-                DR_ASSERT(false);
+            DR_ASSERT(false);
         enable_tracing_instrumentation();
 #else
         void *drcontext = dr_get_current_drcontext();
@@ -622,17 +624,16 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
         if (next_pc)
             mcontext.pc = dr_app_pc_as_jump_target(dr_get_isa_mode(drcontext), next_pc);
         else
-            mcontext.pc = dr_app_pc_as_jump_target(dr_get_isa_mode(drcontext), mcontext.pc);
-//mcontext.xcx = *(uint64_t*)(data->seg_base + 0xe8);
-//mcontext.rcx = *(uint64_t*)(data->seg_base + 0xe8);
+            mcontext.pc =
+                dr_app_pc_as_jump_target(dr_get_isa_mode(drcontext), mcontext.pc);
+        // mcontext.xcx = *(uint64_t*)(data->seg_base + 0xe8);
+        // mcontext.rcx = *(uint64_t*)(data->seg_base + 0xe8);
         NOTIFY(0,
-               "Thread " UINT64_FORMAT_STRING
-               ": rcx = " HEX64_FORMAT_STRING
-               ": xcx = " HEX64_FORMAT_STRING
-               "  rdx = " HEX64_FORMAT_STRING
-               "  xdx = " HEX64_FORMAT_STRING
-               ").\n",
-               dr_get_thread_id(drcontext), mcontext.rcx, mcontext.xcx, mcontext.rdx, mcontext.xdx);
+               "Thread " UINT64_FORMAT_STRING ": rcx = " HEX64_FORMAT_STRING
+               ": xcx = " HEX64_FORMAT_STRING "  rdx = " HEX64_FORMAT_STRING
+               "  xdx = " HEX64_FORMAT_STRING ").\n",
+               dr_get_thread_id(drcontext), mcontext.rcx, mcontext.xcx, mcontext.rdx,
+               mcontext.xdx);
         dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
         dr_redirect_execution(&mcontext);
         DR_ASSERT(false);
@@ -883,10 +884,11 @@ instrument_clean_call(void *drcontext, instrlist_t *ilist, instr_t *where,
                               OPND_CREATE_MEMPTR(reg_ptr, 0)));
     reg_id_t reg_tmp = insert_conditional_skip(drcontext, ilist, where, reg_ptr,
                                                skip_call, short_reaches);
-    //dr_insert_clean_call_ex(drcontext, ilist, where, (void *)clean_call,
+    // dr_insert_clean_call_ex(drcontext, ilist, where, (void *)clean_call,
     //                        DR_CLEANCALL_ALWAYS_OUT_OF_LINE, 0);
-    dr_insert_clean_call_ex(drcontext, ilist, where, (void *)clean_call, DR_CLEANCALL_ALWAYS_OUT_OF_LINE, 1,
-                         OPND_CREATE_INTPTR((ptr_uint_t)instr_get_app_pc(where)));
+    dr_insert_clean_call_ex(drcontext, ilist, where, (void *)clean_call,
+                            DR_CLEANCALL_ALWAYS_OUT_OF_LINE, 1,
+                            OPND_CREATE_INTPTR((ptr_uint_t)instr_get_app_pc(where)));
     insert_conditional_skip_target(drcontext, ilist, where, skip_call, reg_tmp,
                                    DR_REG_NULL);
     insert_conditional_skip_target(drcontext, ilist, where, skip_thread, reg_thread,
@@ -1516,10 +1518,10 @@ disable_tracing_instrumentation()
 {
     dr_unregister_filter_syscall_event(event_filter_syscall);
     if (!drmgr_unregister_pre_syscall_event(event_pre_syscall) ||
-            !drmgr_unregister_kernel_xfer_event(event_kernel_xfer) ||
-            !drmgr_unregister_bb_instrumentation_ex_event(
-                event_bb_app2app, event_bb_analysis, event_app_instruction,
-                event_bb_instru2instru))
+        !drmgr_unregister_kernel_xfer_event(event_kernel_xfer) ||
+        !drmgr_unregister_bb_instrumentation_ex_event(event_bb_app2app, event_bb_analysis,
+                                                      event_app_instruction,
+                                                      event_bb_instru2instru))
         DR_ASSERT(false);
 }
 
@@ -2052,25 +2054,27 @@ init_offline_dir(void)
 }
 
 static bool
-should_skip_process (const char * str)
+should_skip_process(const char *str)
 {
-  const char * procs_to_skip[] = { "bash", "dash", "numactl", "specinvoke" };
-  int num_procs = sizeof (procs_to_skip) / sizeof (procs_to_skip[0]);
+    const char *procs_to_skip[] = { "bash", "dash", "numactl", "specinvoke" };
+    int num_procs = sizeof(procs_to_skip) / sizeof(procs_to_skip[0]);
 
-  for (int i = 0; i < num_procs; i++)
-    if (strcmp(str, procs_to_skip[i]) == 0)
-      return true;
-  return false;
+    for (int i = 0; i < num_procs; i++) {
+        if (strcmp(str, procs_to_skip[i]) == 0)
+            return true;
+    }
+    return false;
 }
 
 #ifdef UNIX
 static void
 fork_init(void *drcontext)
 {
-    if (skip_some_processes)
+    if (skip_some_processes) {
         if (should_skip_process(dr_get_application_name())) {
             return;
         }
+    }
     /* We use DR_FILE_CLOSE_ON_FORK, and we dumped outstanding data prior to the
      * fork syscall, so we just need to create a new subdir, new module log, and
      * a new initial thread file for offline, or register the new process for
@@ -2145,17 +2149,17 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
 
     if (op_offline.get_value()) {
         void *placement;
-        if (!skip_some_processes || 
-               !should_skip_process(dr_get_application_name())) {
+        if (!skip_some_processes || !should_skip_process(dr_get_application_name())) {
             if (!init_offline_dir()) {
                 FATAL("Failed to create a subdir in %s\n", op_outdir.get_value().c_str());
             }
             /* we use placement new for better isolation */
             DR_ASSERT(MAX_INSTRU_SIZE >= sizeof(offline_instru_t));
             placement = dr_global_alloc(MAX_INSTRU_SIZE);
-            instru = new (placement) offline_instru_t(
-                    insert_load_buf_ptr, op_L0_filter.get_value(), &scratch_reserve_vec,
-                    file_ops_func.write_file, module_file, op_disable_optimizations.get_value());
+            instru = new (placement)
+                offline_instru_t(insert_load_buf_ptr, op_L0_filter.get_value(),
+                                 &scratch_reserve_vec, file_ops_func.write_file,
+                                 module_file, op_disable_optimizations.get_value());
         }
         if (op_use_physical.get_value()) {
             /* TODO i#4014: Add support for this combination. */
