@@ -453,6 +453,8 @@ open_post_trace(void *drcontext)
     BUF_PTR(data->seg_base) =
         data->buf_base + data->init_header_size + buf_hdr_slots_size;
 }
+static volatile bool warmup_tracing_done = false;
+static void *warmup_tracing_lock = NULL;
 
 static void
 memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
@@ -607,14 +609,24 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
         data->num_refs = 0;
         data->bytes_written = 0;
         // dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
-        op_warmup_refs.set_value(0);
-        op_L0_filter.set_value(0);
 #if 1
-        disable_tracing_instrumentation();
-        open_post_trace(drcontext);
-        if (!dr_unlink_flush_region(NULL, ~0UL))
-            DR_ASSERT(false);
-        enable_tracing_instrumentation();
+        bool do_flush = false;
+        dr_mutex_lock(warmup_tracing_lock);
+        if (!warmup_tracing_done) {
+            do_flush = true;
+            warmup_tracing_done = true;
+        }
+        dr_mutex_unlock(warmup_tracing_lock);
+
+        if (do_flush) {
+            op_warmup_refs.set_value(0);
+            op_L0_filter.set_value(0);
+            disable_tracing_instrumentation();
+            open_post_trace(drcontext);
+            if (!dr_unlink_flush_region(NULL, ~0UL))
+                DR_ASSERT(false);
+            enable_tracing_instrumentation();
+        }
 #else
         void *drcontext = dr_get_current_drcontext();
         dr_mcontext_t mcontext;
@@ -1494,6 +1506,7 @@ enable_delay_instrumentation()
             event_delay_bb_analysis, event_delay_app_instruction, &memtrace_pri))
         DR_ASSERT(false);
     schedule_tracing_lock = dr_mutex_create();
+    warmup_tracing_lock = dr_mutex_create();
 }
 
 static void
@@ -1990,6 +2003,8 @@ event_exit(void)
     drutil_exit();
     if (op_trace_after_instrs.get_value() > 0)
         exit_delay_instrumentation();
+    if (warmup_tracing_lock)
+        dr_mutex_destroy(warmup_tracing_lock);
     drmgr_exit();
     func_trace_exit();
     drx_exit();
