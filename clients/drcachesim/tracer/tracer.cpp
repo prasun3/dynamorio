@@ -420,7 +420,8 @@ open_post_trace(void *drcontext)
 {
     per_thread_t *data = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     DR_ASSERT(data);
-    NOTIFY(0, "In open_post_trace.\n");
+    NOTIFY(0, "Thread " UINT64_FORMAT_STRING ": In open_post_trace.\n",
+           dr_get_thread_id(drcontext));
 
     byte *buf_ptr = BUF_PTR(data->seg_base);
     BUF_PTR(data->seg_base) +=
@@ -440,7 +441,6 @@ open_post_trace(void *drcontext)
     data->file = file_ops_func.open_file(buf, flags);
     DR_ASSERT(data->file != INVALID_FILE);
 
-    instru->clear_memref_needs_info();
     offline_file_type_t file_type = OFFLINE_FILE_TYPE_DEFAULT;
     file_type = static_cast<offline_file_type_t>(
         file_type |
@@ -453,7 +453,9 @@ open_post_trace(void *drcontext)
     BUF_PTR(data->seg_base) =
         data->buf_base + data->init_header_size + buf_hdr_slots_size;
 }
+
 static volatile bool warmup_tracing_done = false;
+static volatile bool warmup_switch_completed = false;
 static void *warmup_tracing_lock = NULL;
 
 static void
@@ -596,19 +598,8 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
     }
     BUF_PTR(data->seg_base) = data->buf_base + buf_hdr_slots_size;
     num_refs_racy += current_num_refs;
-    if (next_pc && data->warmup_refs > 0 && data->num_refs > data->warmup_refs) {
+    if (next_pc && data->warmup_refs > 0 && num_refs_racy > op_warmup_refs.get_value()) {
         // dr_mutex_lock(mutex);
-        NOTIFY(0,
-               "Thread " UINT64_FORMAT_STRING
-               ": Switching to full trace after ~" UINT64_FORMAT_STRING
-               " references for this thread (global references = " UINT64_FORMAT_STRING
-               ").\n",
-               dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
-        num_refs_racy = 0;
-        data->warmup_refs = 0;
-        data->num_refs = 0;
-        data->bytes_written = 0;
-        // dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
 #if 1
         bool do_flush = false;
         dr_mutex_lock(warmup_tracing_lock);
@@ -619,13 +610,29 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
         dr_mutex_unlock(warmup_tracing_lock);
 
         if (do_flush) {
-            op_warmup_refs.set_value(0);
+            // op_warmup_refs.set_value(0);
             op_L0_filter.set_value(0);
             disable_tracing_instrumentation();
-            open_post_trace(drcontext);
             if (!dr_unlink_flush_region(NULL, ~0UL))
                 DR_ASSERT(false);
             enable_tracing_instrumentation();
+            instru->clear_memref_needs_info();
+            warmup_switch_completed = true;
+        }
+        if (warmup_switch_completed) {
+            NOTIFY(
+                0,
+                "Thread " UINT64_FORMAT_STRING
+                ": Switching to full trace after ~" UINT64_FORMAT_STRING
+                " references for this thread (global references = " UINT64_FORMAT_STRING
+                ").\n",
+                dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
+            // num_refs_racy = 0;
+            data->warmup_refs = 0;
+            data->num_refs = 0; // reset so that memtrace writes a header
+            data->bytes_written = 0;
+            // dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
+            open_post_trace(drcontext);
         }
 #else
         void *drcontext = dr_get_current_drcontext();

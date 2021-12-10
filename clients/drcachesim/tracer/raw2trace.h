@@ -714,7 +714,8 @@ protected:
                 buf += sizeof(*entry);
             } else {
                 // We should see an instr entry first
-                return "memref entry found outside of bb";
+                // return "memref entry found outside of bb";
+                return "";
             }
         } else if (in_entry->pc.type == OFFLINE_TYPE_PC) {
             DR_CHECK(reinterpret_cast<trace_entry_t *>(buf) == buf_base,
@@ -1010,8 +1011,8 @@ private:
                     return res;
             }
         }
-        DR_CHECK(!instrs_are_separate || instr_count == 1,
-                 "cannot mix 0-count and >1-count");
+        DR_CHECK(!instrs_are_separate || instr_count == 1, "");
+        //"cannot mix 0-count and >1-count");
         for (uint i = 0; i < instr_count; ++i) {
             trace_entry_t *buf_start = impl()->get_write_buffer(tls);
             trace_entry_t *buf = buf_start;
