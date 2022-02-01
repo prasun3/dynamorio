@@ -192,6 +192,12 @@ public:
         return instr_size_;
     }
 
+    void
+    clear_memref_needs_info()
+    {
+      memref_needs_full_info_ = false;
+    }
+
     virtual trace_type_t
     get_entry_type(byte *buf_ptr) const = 0;
     virtual size_t
@@ -218,6 +224,21 @@ public:
     // This is a per-buffer-writeout header.
     virtual int
     append_unit_header(byte *buf_ptr, thread_id_t tid) = 0;
+
+    byte *
+    skip_non_pc_entries(byte *buf_ptr_start, byte *buf_ptr_end)
+    {
+        offline_entry_t *entry = (offline_entry_t *)buf_ptr_start;
+        while (entry < (offline_entry_t *)buf_ptr_end) {
+            if (entry->pc.type == OFFLINE_TYPE_PC)
+                return (byte *)entry;
+            entry++;
+        }
+        return nullptr;
+    }
+
+    // virtual byte *
+    // skip_non_pc_entries(byte *buf_ptr_start, byte *buf_ptr_end) = 0;
     virtual void
     set_frozen_timestamp(uint64 timestamp)
     {

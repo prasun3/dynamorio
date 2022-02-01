@@ -938,10 +938,11 @@ raw2trace_t::get_next_entry(void *tls)
                                       sizeof(tdata->last_entry)))
             return nullptr;
     }
-    VPRINT(5, "[get_next_entry]: type=%d\n",
+    VPRINT(5, "[get_next_entry]: type=%d (%lx)\n",
            // Some compilers think .addr.type is "int" while others think it's "unsigned
            // long".  We avoid dueling warnings by casting to int.
-           static_cast<int>(tdata->last_entry.addr.type));
+           static_cast<int>(tdata->last_entry.addr.type),
+           tdata->last_entry.combined_value);
     return &tdata->last_entry;
 }
 
