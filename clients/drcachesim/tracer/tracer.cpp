@@ -211,7 +211,7 @@ enable_tracing_instrumentation();
 static void
 disable_tracing_instrumentation();
 #if 1
-static void
+static bool
 hit_warmup_threshold(app_pc next_pc);
 #endif
 
@@ -374,12 +374,12 @@ create_buffer(per_thread_t *data)
 }
 
 static int
-append_unit_header(void *drcontext, byte *buf_ptr, thread_id_t tid)
+append_unit_header(void *drcontext, byte *buf_ptr, thread_id_t tid, bool inst_count)
 {
     int size_added = instru->append_unit_header(buf_ptr, tid);
     // NOTIFY(0, "append_unit_header op_L0_filter=%d op_L0_warmup_refs=%d\n",
     // op_L0_filter.get_value(), op_L0_warmup_refs.get_value());
-    if (op_L0_filter.get_value()) {
+    if (inst_count) {
         // Include the instruction count.
         // It might be useful to include the count with each miss as well, but
         // in experiments that adds non-trivial space and time overheads (as
@@ -412,7 +412,8 @@ atomic_pipe_write(void *drcontext, byte *pipe_start, byte *pipe_end)
     // Re-emit buffer unit header to handle split pipe writes.
     if (pipe_end - buf_hdr_slots_size > pipe_start) {
         pipe_start = pipe_end - buf_hdr_slots_size;
-        append_unit_header(drcontext, pipe_start, dr_get_thread_id(drcontext));
+        append_unit_header(drcontext, pipe_start, dr_get_thread_id(drcontext),
+                           op_L0_filter.get_value());
     }
     return pipe_start;
 }
@@ -511,7 +512,7 @@ open_post_trace(void *drcontext)
 
     /* Append a throwaway header to get its size. */
     buf_hdr_slots_size =
-        append_unit_header(NULL /*no TLS yet*/, header_buf, 0 /*doesn't matter*/);
+        append_unit_header(NULL /*no TLS yet*/, header_buf, 0 /*doesn't matter*/, false);
     DR_ASSERT(BUFFER_SIZE_BYTES(buf) >= buf_hdr_slots_size);
 
     BUF_PTR(data->seg_base) =
@@ -543,7 +544,8 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
         return;
     // The initial slots are left empty for the header, which we add here.
     header_size += append_unit_header(drcontext, data->buf_base + header_size,
-                                      dr_get_thread_id(drcontext));
+                                      dr_get_thread_id(drcontext),
+                                      op_L0_filter.get_value() || data->warmup_refs > 0);
     pipe_start = data->buf_base;
     pipe_end = pipe_start;
     // check for data->warmup_refs==0 because these limits are not for the warmup trace
@@ -583,6 +585,31 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
         }
     } else
         data->bytes_written += buf_ptr - pipe_start;
+
+    /////////////
+    // avoid writing buffer which might contain records from both warmup and inst trace
+    if (next_pc && data->warmup_refs > 0 &&
+        num_refs_racy > op_L0_warmup_refs.get_value()) {
+        NOTIFY(0,
+               "Thread " UINT64_FORMAT_STRING
+               ": skipped writing last page of warmup trace (global "
+               "references " UINT64_FORMAT_STRING ")\n",
+               dr_get_thread_id(drcontext), num_refs_racy);
+        do_write = false;
+        BUF_PTR(data->seg_base) =
+            data->buf_base + data->init_header_size + buf_hdr_slots_size;
+    }
+    if (warmup_tracing_done && !warmup_switch_completed) {
+        NOTIFY(0,
+               "Thread " UINT64_FORMAT_STRING
+               ": skipped writing trace during instru switch (global "
+               "references " UINT64_FORMAT_STRING ")\n",
+               dr_get_thread_id(drcontext), num_refs_racy);
+        do_write = false;
+        BUF_PTR(data->seg_base) =
+            data->buf_base + data->init_header_size + buf_hdr_slots_size;
+    }
+    /////////////
 
     if (do_write) {
         if (have_phys && op_use_physical.get_value()) {
@@ -686,7 +713,8 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
         num_refs_racy > op_L0_warmup_refs.get_value()) {
         // dr_mutex_lock(mutex);
 
-        if (data->file != INVALID_FILE && !warmup_tracing_done) {
+#if 0
+        if (data->file != INVALID_FILE) {
             NOTIFY(
                 0,
                 "Thread " UINT64_FORMAT_STRING
@@ -707,6 +735,7 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
             op_L0_filter.set_value(0);
             open_post_trace(drcontext);
         }
+#endif
 
 #if 1
 #    if 0
@@ -729,11 +758,33 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
             warmup_switch_completed = true;
         }
 #    else
+        bool did_flush = false;
         if (!warmup_tracing_done) {
-            hit_warmup_threshold(next_pc);
+            did_flush = hit_warmup_threshold(next_pc);
         }
 #    endif
-        if (warmup_switch_completed && data->file == INVALID_FILE) {
+        if (warmup_switch_completed && !did_flush) {
+            NOTIFY(
+                0,
+                "Thread " UINT64_FORMAT_STRING
+                ": Warmup completed at ~" UINT64_FORMAT_STRING
+                " references for this thread (global references = " UINT64_FORMAT_STRING
+                ").\n",
+                dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
+            byte *buf_ptr = BUF_PTR(data->seg_base);
+            BUF_PTR(data->seg_base) += instru->append_thread_exit(
+                BUF_PTR(data->seg_base), dr_get_thread_id(drcontext));
+            write_trace_data(drcontext, buf_ptr, BUF_PTR(data->seg_base));
+
+            file_ops_func.close_file(data->file);
+            data->file = INVALID_FILE;
+            data->warmup_refs = 0;
+            data->num_refs = 0; // reset so that memtrace writes a header
+            data->bytes_written = 0;
+            op_L0_filter.set_value(0);
+            open_post_trace(drcontext);
+
+#    if 0
             NOTIFY(
                 0,
                 "Thread " UINT64_FORMAT_STRING
@@ -747,6 +798,7 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
             data->bytes_written = 0;
             // dr_flush_region_ex(NULL, ~0UL, open_post_trace, drcontext);
             open_post_trace(drcontext);
+#    endif
         }
 #else
         void *drcontext = dr_get_current_drcontext();
@@ -1837,7 +1889,7 @@ change_warmup_callback(void *unused_user_data)
     DR_ASSERT(data);
 }
 
-static void
+static bool
 hit_warmup_threshold(app_pc next_pc)
 {
     void *drcontext = dr_get_current_drcontext();
@@ -1855,6 +1907,26 @@ hit_warmup_threshold(app_pc next_pc)
     dr_mutex_unlock(warmup_tracing_lock);
 
     if (do_flush) {
+        per_thread_t *data = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        NOTIFY(0,
+               "Thread " UINT64_FORMAT_STRING
+               ": Warmup completed at ~" UINT64_FORMAT_STRING
+               " references for this thread (global references = " UINT64_FORMAT_STRING
+               ").\n",
+               dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
+        byte *buf_ptr = BUF_PTR(data->seg_base);
+        BUF_PTR(data->seg_base) += instru->append_thread_exit(
+            BUF_PTR(data->seg_base), dr_get_thread_id(drcontext));
+        write_trace_data(drcontext, buf_ptr, BUF_PTR(data->seg_base));
+
+        file_ops_func.close_file(data->file);
+        data->file = INVALID_FILE;
+        data->warmup_refs = 0;
+        data->num_refs = 0; // reset so that memtrace writes a header
+        data->bytes_written = 0;
+        op_L0_filter.set_value(0);
+        open_post_trace(drcontext);
+
         if (true) {
             if (!dr_flush_region_ex(NULL, ~0UL, change_warmup_callback,
                                     NULL /*user_data*/))
@@ -1870,6 +1942,9 @@ hit_warmup_threshold(app_pc next_pc)
         } else {
             change_warmup_callback((void *)1);
         }
+        return true;
+    } else {
+        return false;
     }
 }
 #endif
@@ -2569,8 +2644,8 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
     /* Mark any padding as redzone as well */
     redzone_size = max_buf_size - trace_buf_size;
     /* Append a throwaway header to get its size. */
-    buf_hdr_slots_size =
-        append_unit_header(NULL /*no TLS yet*/, buf, 0 /*doesn't matter*/);
+    buf_hdr_slots_size = append_unit_header(
+        NULL /*no TLS yet*/, buf, 0 /*doesn't matter*/, op_L0_filter.get_value());
     DR_ASSERT(BUFFER_SIZE_BYTES(buf) >= buf_hdr_slots_size);
 
     client_id = id;
