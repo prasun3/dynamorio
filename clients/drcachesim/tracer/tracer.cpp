@@ -590,7 +590,7 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
     // avoid writing buffer which might contain records from both warmup and inst trace
     if (next_pc && data->warmup_refs > 0 &&
         num_refs_racy > op_L0_warmup_refs.get_value()) {
-        NOTIFY(0,
+        NOTIFY(3,
                "Thread " UINT64_FORMAT_STRING
                ": skipped writing last page of warmup trace (global "
                "references " UINT64_FORMAT_STRING ")\n",
@@ -600,7 +600,7 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
             data->buf_base + data->init_header_size + buf_hdr_slots_size;
     }
     if (warmup_tracing_done && !warmup_switch_completed) {
-        NOTIFY(0,
+        NOTIFY(3,
                "Thread " UINT64_FORMAT_STRING
                ": skipped writing trace during instru switch (global "
                "references " UINT64_FORMAT_STRING ")\n",
@@ -769,7 +769,7 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
                 "Thread " UINT64_FORMAT_STRING
                 ": Warmup completed at ~" UINT64_FORMAT_STRING
                 " references for this thread (global references = " UINT64_FORMAT_STRING
-                ").\n",
+                "). No flush needed.\n",
                 dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
             byte *buf_ptr = BUF_PTR(data->seg_base);
             BUF_PTR(data->seg_base) += instru->append_thread_exit(
@@ -781,7 +781,6 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
             data->warmup_refs = 0;
             data->num_refs = 0; // reset so that memtrace writes a header
             data->bytes_written = 0;
-            op_L0_filter.set_value(0);
             open_post_trace(drcontext);
 
 #    if 0
@@ -1912,7 +1911,7 @@ hit_warmup_threshold(app_pc next_pc)
                "Thread " UINT64_FORMAT_STRING
                ": Warmup completed at ~" UINT64_FORMAT_STRING
                " references for this thread (global references = " UINT64_FORMAT_STRING
-               ").\n",
+               "). Flushing code cache.\n",
                dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
         byte *buf_ptr = BUF_PTR(data->seg_base);
         BUF_PTR(data->seg_base) += instru->append_thread_exit(
@@ -1924,7 +1923,6 @@ hit_warmup_threshold(app_pc next_pc)
         data->warmup_refs = 0;
         data->num_refs = 0; // reset so that memtrace writes a header
         data->bytes_written = 0;
-        op_L0_filter.set_value(0);
         open_post_trace(drcontext);
 
         if (true) {
@@ -1944,6 +1942,8 @@ hit_warmup_threshold(app_pc next_pc)
         }
         return true;
     } else {
+        NOTIFY(0, "Thread " UINT64_FORMAT_STRING ": Flush initiated already\n",
+               dr_get_thread_id(drcontext));
         return false;
     }
 }
