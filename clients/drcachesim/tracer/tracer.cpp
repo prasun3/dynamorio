@@ -588,8 +588,7 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
 
     /////////////
     // avoid writing buffer which might contain records from both warmup and inst trace
-    if (next_pc && data->warmup_refs > 0 &&
-        num_refs_racy > op_L0_warmup_refs.get_value()) {
+    if (data->warmup_refs > 0 && num_refs_racy > op_L0_warmup_refs.get_value()) {
         NOTIFY(3,
                "Thread " UINT64_FORMAT_STRING
                ": skipped writing last page of warmup trace (global "

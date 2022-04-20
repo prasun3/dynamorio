@@ -681,6 +681,28 @@ raw2trace_t::process_tasks(std::vector<raw2trace_thread_data_t *> *tasks)
             break;
         }
         VPRINT(1, "Worker %d finished trace thread %d\n", tdata->worker, tdata->index);
+        //
+        // XXX: We can't use a free-payload function b/c we can't get the dcontext there,
+        // so we have to explicitly free the payloads.
+        for (uint j = 0; j < HASHTABLE_SIZE(decode_cache_[tdata->worker].table_bits);
+             j++) {
+            for (hash_entry_t *e = decode_cache_[tdata->worker].table[j]; e != NULL;
+                 e = e->next) {
+                delete (static_cast<block_summary_t *>(e->payload));
+            }
+        }
+        hashtable_delete(&decode_cache_[tdata->worker]);
+        // We go ahead and start with a reasonably large capacity.
+        // We do not want the built-in mutex: this is per-worker so it can be lockless.
+        hashtable_init_ex(&decode_cache_[tdata->worker], 16, HASH_INTPTR, false, false,
+                          nullptr, nullptr, nullptr);
+        // We pay a little memory to get a lower load factor, unless we have
+        // many duplicated tables.
+        hashtable_config_t config = { sizeof(config), true,
+                                      worker_count_ <= 8
+                                          ? 40U
+                                          : (worker_count_ <= 16 ? 50U : 60U) };
+        hashtable_configure(&decode_cache_[tdata->worker], &config);
     }
 }
 
