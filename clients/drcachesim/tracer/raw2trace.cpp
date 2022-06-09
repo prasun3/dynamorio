@@ -960,7 +960,7 @@ raw2trace_t::get_next_entry(void *tls)
                                       sizeof(tdata->last_entry)))
             return nullptr;
     }
-    VPRINT(5, "[get_next_entry]: type=%d (%lx)\n",
+    VPRINT(5, "[get_next_entry]: type=%d (" HEX64_FORMAT_STRING ")\n",
            // Some compilers think .addr.type is "int" while others think it's "unsigned
            // long".  We avoid dueling warnings by casting to int.
            static_cast<int>(tdata->last_entry.addr.type),

@@ -770,10 +770,10 @@ memtrace(void *drcontext, bool skip_size_cap, app_pc next_pc)
                 " references for this thread (global references = " UINT64_FORMAT_STRING
                 "). No flush needed.\n",
                 dr_get_thread_id(drcontext), data->num_refs, num_refs_racy);
-            byte *buf_ptr = BUF_PTR(data->seg_base);
+            byte *buf_ptr2 = BUF_PTR(data->seg_base);
             BUF_PTR(data->seg_base) += instru->append_thread_exit(
                 BUF_PTR(data->seg_base), dr_get_thread_id(drcontext));
-            write_trace_data(drcontext, buf_ptr, BUF_PTR(data->seg_base));
+            write_trace_data(drcontext, buf_ptr2, BUF_PTR(data->seg_base));
 
             file_ops_func.close_file(data->file);
             data->file = INVALID_FILE;
